@@ -1,5 +1,3 @@
-# streamlit_app.py
-
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -9,10 +7,22 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
+import os
 
 
 st.set_page_config(page_title="Pallet Detection", layout="wide")
 
+
+# =========================
+# PATH
+# =========================
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "pallet_rnn_count.pt"
+
+
+# =========================
+# STYLE
+# =========================
 st.markdown("""
 <style>
 .stApp {
@@ -24,19 +34,11 @@ h1, h2, h3, h4, h5, h6, p, label, span, div {
     color: #f8fafc !important;
 }
 
-/* =========================
-INPUT / TEXTBOX
-========================= */
 input, textarea {
     color: #000000 !important;
     background-color: #ffffff !important;
 }
 
-/* =========================
-SELECTBOX
-========================= */
-
-/* selected value */
 [data-baseweb="select"] > div {
     background-color: #000000 !important;
     color: #ffffff !important;
@@ -44,32 +46,25 @@ SELECTBOX
     border: 1px solid #444 !important;
 }
 
-/* selected text */
 [data-baseweb="select"] span {
     color: #ffffff !important;
 }
 
-/* dropdown menu */
 div[role="listbox"] {
     background-color: #000000 !important;
     border: 1px solid #333 !important;
 }
 
-/* dropdown item */
 div[role="option"] {
     background-color: #000000 !important;
     color: #ffffff !important;
 }
 
-/* hover */
 div[role="option"]:hover {
     background-color: #1f2937 !important;
     color: #38f8a6 !important;
 }
 
-/* =========================
-FILE UPLOADER
-========================= */
 [data-testid="stFileUploader"] section {
     border: 2px solid #000000 !important;
     border-radius: 14px !important;
@@ -86,9 +81,6 @@ FILE UPLOADER
     background: #ffffff !important;
 }
 
-/* =========================
-CARDS
-========================= */
 .main-card {
     background: linear-gradient(180deg, #111d33 0%, #0a1222 100%);
     border-radius: 26px;
@@ -117,9 +109,6 @@ CARDS
     letter-spacing: 1px;
 }
 
-/* =========================
-BUTTON
-========================= */
 .stButton > button {
     background: #22c55e;
     color: white !important;
@@ -132,17 +121,10 @@ BUTTON
 """, unsafe_allow_html=True)
 
 
-st.title("Pallet Detection")
-st.caption(
-    "Upload/ถ่ายรูป → RNN Predict → ปรับความแม่นยำ → แสดงเส้นวัดสีเหลือง → Confirm → Export Excel"
-)
-
-
-MODEL_PATH = Path("/workspaces/palletdetect/pallet_rnn_count.pt")
-
-
+# =========================
+# MODEL CLASS
+# =========================
 class PalletRNNCounter(nn.Module):
-
     def __init__(self):
         super().__init__()
 
@@ -174,7 +156,6 @@ class PalletRNNCounter(nn.Module):
         )
 
     def forward(self, x):
-
         x = self.cnn(x)
 
         b, c, h, w = x.shape
@@ -187,41 +168,56 @@ class PalletRNNCounter(nn.Module):
         return self.fc(out[:, -1, :])
 
 
+# =========================
+# LOAD MODEL
+# =========================
 @st.cache_resource
 def load_model():
-
     if not MODEL_PATH.exists():
         st.error(f"ไม่พบไฟล์ model: {MODEL_PATH}")
+        st.write("Current Directory:", os.getcwd())
+        st.write("BASE_DIR:", BASE_DIR)
+        st.write("Files in BASE_DIR:", [f.name for f in BASE_DIR.iterdir()])
         st.stop()
 
     model = PalletRNNCounter()
 
-    model.load_state_dict(
-        torch.load(MODEL_PATH, map_location="cpu")
-    )
+    try:
+        state_dict = torch.load(MODEL_PATH, map_location="cpu")
+        model.load_state_dict(state_dict)
+    except Exception as e:
+        st.error("โหลด model ไม่สำเร็จ")
+        st.exception(e)
+        st.stop()
 
     model.eval()
-
     return model
 
 
 model = load_model()
 
+
+# =========================
+# TRANSFORM
+# =========================
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
 ])
 
 
+# =========================
+# SESSION
+# =========================
 if "records" not in st.session_state:
     st.session_state.records = []
 
 
+# =========================
+# FUNCTIONS
+# =========================
 def predict_count(image):
-
-    tensor = transform(
-        image.convert("RGB")
-    ).unsqueeze(0)
+    tensor = transform(image.convert("RGB")).unsqueeze(0)
 
     with torch.no_grad():
         pred = model(tensor).item()
@@ -229,22 +225,11 @@ def predict_count(image):
     return pred, max(0, round(pred))
 
 
-def draw_dashed_line(
-    draw,
-    start,
-    end,
-    fill,
-    width=4,
-    dash_length=22,
-    gap_length=12
-):
-
+def draw_dashed_line(draw, start, end, fill, width=4, dash_length=22, gap_length=12):
     x1, y1 = start
     x2, y2 = end
 
-    total_len = (
-        ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-    )
+    total_len = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
 
     if total_len == 0:
         return
@@ -255,37 +240,22 @@ def draw_dashed_line(
     dist = 0
 
     while dist < total_len:
-
-        dash_end = min(
-            dist + dash_length,
-            total_len
-        )
+        dash_end = min(dist + dash_length, total_len)
 
         sx = x1 + dx * dist
         sy = y1 + dy * dist
-
         ex = x1 + dx * dash_end
         ey = y1 + dy * dash_end
 
-        draw.line(
-            [(sx, sy), (ex, ey)],
-            fill=fill,
-            width=width
-        )
+        draw.line([(sx, sy), (ex, ey)], fill=fill, width=width)
 
         dist += dash_length + gap_length
 
 
 def draw_measurement_overlay(image, count):
-
     img = image.copy().convert("RGB")
 
-    blue_overlay = Image.new(
-        "RGB",
-        img.size,
-        (0, 130, 200)
-    )
-
+    blue_overlay = Image.new("RGB", img.size, (0, 130, 200))
     img = Image.blend(img, blue_overlay, 0.10)
     img = img.filter(ImageFilter.SHARPEN)
 
@@ -303,16 +273,12 @@ def draw_measurement_overlay(image, count):
     bottom_margin = int(h * 0.88)
 
     area_height = bottom_margin - top_margin
-
     step = area_height / count
 
     yellow = (255, 220, 60)
 
     for i in range(count):
-
-        y = int(
-            top_margin + step * i + step / 2
-        )
+        y = int(top_margin + step * i + step / 2)
 
         draw_dashed_line(
             draw=draw,
@@ -332,14 +298,9 @@ def draw_measurement_overlay(image, count):
 
 
 def to_excel(df):
-
     output = BytesIO()
 
-    with pd.ExcelWriter(
-        output,
-        engine="openpyxl"
-    ) as writer:
-
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(
             writer,
             index=False,
@@ -349,12 +310,25 @@ def to_excel(df):
     return output.getvalue()
 
 
-with st.container():
+# =========================
+# UI
+# =========================
+st.title("Pallet Detection")
 
-    st.markdown(
-        '<div class="main-card">',
-        unsafe_allow_html=True
-    )
+st.caption(
+    "Upload/ถ่ายรูป → RNN Predict → ปรับความแม่นยำ → แสดงเส้นวัดสีเหลือง → Confirm → Export Excel"
+)
+
+with st.expander("Debug Model Path", expanded=False):
+    st.write("Current Directory:", os.getcwd())
+    st.write("BASE_DIR:", str(BASE_DIR))
+    st.write("MODEL_PATH:", str(MODEL_PATH))
+    st.write("MODEL EXISTS:", MODEL_PATH.exists())
+    st.write("MODEL SIZE MB:", round(MODEL_PATH.stat().st_size / 1024 / 1024, 2) if MODEL_PATH.exists() else None)
+
+
+with st.container():
+    st.markdown('<div class="main-card">', unsafe_allow_html=True)
 
     top1, top2 = st.columns([1, 1])
 
@@ -372,20 +346,14 @@ with st.container():
     uploaded_image = None
 
     if image_source == "Upload รูปภาพ":
-
         uploaded_image = st.file_uploader(
             "Upload รูปพาเลท",
             type=["jpg", "jpeg", "png"]
         )
-
     else:
-
-        uploaded_image = st.camera_input(
-            "ถ่ายรูปพาเลท"
-        )
+        uploaded_image = st.camera_input("ถ่ายรูปพาเลท")
 
     if uploaded_image is not None:
-
         image = Image.open(uploaded_image).convert("RGB")
 
         raw_pred, base_count = predict_count(image)
@@ -393,7 +361,6 @@ with st.container():
         img_col, side_col = st.columns([2.2, 1])
 
         with side_col:
-
             st.markdown("### Accuracy")
 
             accuracy_slider = st.slider(
@@ -404,34 +371,20 @@ with st.container():
                 step=0.01
             )
 
-            adjusted_count = max(
-                0,
-                round(raw_pred * accuracy_slider)
-            )
+            adjusted_count = max(0, round(raw_pred * accuracy_slider))
 
             st.markdown(
                 f"""
                 <div class="metric-card">
-                    <div class="big-number">
-                        {adjusted_count}
-                    </div>
-                    <div class="label">
-                        PALLET FOUND
-                    </div>
+                    <div class="big-number">{adjusted_count}</div>
+                    <div class="label">PALLET FOUND</div>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            st.metric(
-                "Raw Prediction",
-                f"{raw_pred:.2f}"
-            )
-
-            st.metric(
-                "Model Count",
-                base_count
-            )
+            st.metric("Raw Prediction", f"{raw_pred:.2f}")
+            st.metric("Model Count", base_count)
 
             pallet_type = st.selectbox(
                 "Confirm ประเภทพาเลท",
@@ -459,27 +412,20 @@ with st.container():
         )
 
         with img_col:
-
             st.image(
                 highlighted_img,
                 caption="Measurement Overlay",
                 use_container_width=True
             )
 
-        if st.button(
-            "บันทึกผลตรวจ",
-            type="primary"
-        ):
-
+        if st.button("บันทึกผลตรวจ", type="primary"):
             if weight_ticket.strip() == "":
-
                 st.error("กรุณากรอกเลขตั๋วชั่ง")
-
             else:
-
                 record = {
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "weight_ticket": weight_ticket,
+                    "model_path": str(MODEL_PATH),
                     "model_type": "CNN + GRU/RNN Regression",
                     "raw_prediction": round(raw_pred, 3),
                     "model_count": base_count,
@@ -491,27 +437,20 @@ with st.container():
                 }
 
                 st.session_state.records.append(record)
-
                 st.success("บันทึกข้อมูลเรียบร้อย")
 
-    st.markdown(
-        '</div>',
-        unsafe_allow_html=True
-    )
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
+# =========================
+# HISTORY
+# =========================
 st.markdown("## History")
 
 if len(st.session_state.records) > 0:
+    df = pd.DataFrame(st.session_state.records)
 
-    df = pd.DataFrame(
-        st.session_state.records
-    )
-
-    st.dataframe(
-        df,
-        use_container_width=True
-    )
+    st.dataframe(df, use_container_width=True)
 
     st.download_button(
         label="Download Excel",
@@ -519,7 +458,5 @@ if len(st.session_state.records) > 0:
         file_name="pallet_detection_result.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
 else:
-
     st.info("ยังไม่มีข้อมูลที่บันทึก")
