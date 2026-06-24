@@ -7,9 +7,7 @@ pip install streamlit pandas pillow openpyxl google-genai
 streamlit run pallet_vision_app.py
 """
 
-import os
 import json
-import tempfile
 from datetime import datetime
 
 import pandas as pd
@@ -31,19 +29,35 @@ st.set_page_config(
 
 
 # =========================================================
-# API KEY
+# GEMINI API KEY FROM STREAMLIT SECRETS
 # =========================================================
-# Option 1: set directly here
-os.environ["GEMINI_API_KEY"] = ""
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 
-# Option 2: use Streamlit secrets
-# os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+    if not GEMINI_API_KEY:
+        st.error("GEMINI_API_KEY is empty. Please check Streamlit Secrets.")
+        st.stop()
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+except KeyError:
+    st.error("Missing GEMINI_API_KEY in Streamlit Secrets.")
+    st.info(
+        """
+        Please add this in Streamlit Cloud > App settings > Secrets:
+
+        GEMINI_API_KEY = "your_gemini_api_key_here"
+        """
+    )
+    st.stop()
+
+except Exception as e:
+    st.error(f"Gemini client initialization error: {type(e).__name__}: {e}")
+    st.stop()
 
 
 # =========================================================
-# PROMPT
+# PALLET COUNTING PROMPT
 # =========================================================
 PALLET_PROMPT = """
 You are an expert AI visual inspector specializing in transport pallet logistics and inventory verification.
@@ -158,7 +172,8 @@ JSON shape:
 # =========================================================
 # CSS DESIGN
 # =========================================================
-st.markdown("""
+st.markdown(
+    """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
 
@@ -172,7 +187,7 @@ html, body, [class*="css"] {
 
 .block-container {
     padding-top: 0 !important;
-    max-width: 820px;
+    max-width: 840px;
 }
 
 .topbar {
@@ -403,12 +418,10 @@ div[data-testid="stButton"] > button:hover {
     opacity: 0.92 !important;
 }
 
-div[data-testid="stDataFrame"] {
-    border-radius: 12px;
-}
-
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 # =========================================================
@@ -457,7 +470,7 @@ def normalize_result_rows(result, combined_file_name):
             {
                 "imageFileName": combined_file_name,
                 "palletColor": result.get("palletColor", "unknown"),
-                "palletCount": ai_total
+                "palletCount": ai_total,
             }
         ]
 
@@ -477,7 +490,11 @@ def normalize_result_rows(result, combined_file_name):
 
     df["imageFileName"] = df["imageFileName"].fillna("").replace("", combined_file_name)
     df["palletColor"] = df["palletColor"].fillna("unknown").replace("", "unknown")
-    df["palletCount"] = pd.to_numeric(df["palletCount"], errors="coerce").fillna(0).astype(int)
+
+    df["palletCount"] = pd.to_numeric(
+        df["palletCount"],
+        errors="coerce"
+    ).fillna(0).astype(int)
 
     return df[["imageFileName", "palletColor", "palletCount"]]
 
@@ -501,17 +518,30 @@ def analyze_pallets_with_gemini(side_upload, rear_upload, hint):
             "Image angle: side view",
             side_img,
             "Image angle: rear view",
-            rear_img
+            rear_img,
         ],
         config=types.GenerateContentConfig(
             temperature=0,
             max_output_tokens=2048,
-            response_mime_type="application/json"
-        )
+            response_mime_type="application/json",
+        ),
     )
 
     raw_text = response.text
-    result = json.loads(raw_text)
+
+    try:
+        result = json.loads(raw_text)
+    except Exception:
+        cleaned = raw_text.strip()
+
+        if cleaned.startswith("```json"):
+            cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+        elif cleaned.startswith("```"):
+            cleaned = cleaned.replace("```", "").strip()
+
+        result = json.loads(cleaned)
+        raw_text = cleaned
+
     df = normalize_result_rows(result, combined_file_name)
 
     return result, df, raw_text
@@ -519,6 +549,12 @@ def analyze_pallets_with_gemini(side_upload, rear_upload, hint):
 
 def save_reviewed_result(df, reviewer_note):
     df = pd.DataFrame(df)
+
+    required_cols = ["imageFileName", "palletColor", "palletCount"]
+
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
 
     df["palletCount"] = pd.to_numeric(
         df["palletCount"],
@@ -533,35 +569,46 @@ def save_reviewed_result(df, reviewer_note):
         "finalTotalPallets": final_total,
         "reviewerNote": reviewer_note or "",
         "resultRows": df.to_dict(orient="records"),
-        "aiRawResult": st.session_state.ai_result
+        "aiRawResult": st.session_state.ai_result,
     }
 
-    json_path = "pallet_final_result.json"
-    excel_path = "pallet_final_result.xlsx"
+    json_text = json.dumps(final_result, indent=2, ensure_ascii=False)
+    excel_bytes = create_excel_bytes(df)
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(final_result, f, indent=2, ensure_ascii=False)
+    return json_text, excel_bytes, final_total
 
-    df.to_excel(excel_path, index=False)
 
-    return json_path, excel_path, final_total
+def create_excel_bytes(df):
+    from io import BytesIO
+
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Pallet Result")
+
+    output.seek(0)
+    return output.getvalue()
 
 
 # =========================================================
 # TOP BAR
 # =========================================================
-st.markdown("""
+st.markdown(
+    """
 <div class="topbar">
     <div class="topbar-logo">📦 PalletVision</div>
     <div class="topbar-badge">AI Counting</div>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 # =========================================================
 # STEP BAR
 # =========================================================
-st.markdown("""
+st.markdown(
+    """
 <div class="stepbar">
     <span class="step-done">1</span>
     <span class="step-active">เลือกรูปภาพ</span>
@@ -572,7 +619,9 @@ st.markdown("""
     <span class="step-circle">3</span>
     <span>ยืนยันและบันทึก</span>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 # =========================================================
@@ -583,13 +632,14 @@ col1, col2 = st.columns(2)
 with col1:
     st.markdown(
         '<div class="upload-label-box">📷 ด้านข้างรถบรรทุก<br>Side View</div>',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
+
     side_upload = st.file_uploader(
         "Upload side view",
         type=["jpg", "jpeg", "png"],
         key="side_upload",
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 
     if side_upload:
@@ -598,13 +648,14 @@ with col1:
 with col2:
     st.markdown(
         '<div class="upload-label-box">📷 ด้านหลังรถบรรทุก<br>Rear View</div>',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
+
     rear_upload = st.file_uploader(
         "Upload rear view",
         type=["jpg", "jpeg", "png"],
         key="rear_upload",
-        label_visibility="collapsed"
+        label_visibility="collapsed",
     )
 
     if rear_upload:
@@ -618,7 +669,7 @@ hint = st.text_area(
         "Rear view identifies Width Columns. Side view identifies Depth Rows. "
         "Both views confirm Height Layers."
     ),
-    height=90
+    height=90,
 )
 
 
@@ -629,15 +680,15 @@ if st.button("✨ Analyze with AI", use_container_width=True):
     if not side_upload or not rear_upload:
         st.markdown(
             '<div class="error-box">กรุณาอัปโหลดรูปภาพทั้ง 2 มุม: ด้านข้าง และ ด้านหลัง</div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
     else:
         with st.spinner("AI กำลังวิเคราะห์จำนวนพาเลท..."):
             try:
                 result, df, raw_json = analyze_pallets_with_gemini(
-                    side_upload,
-                    rear_upload,
-                    hint
+                    side_upload=side_upload,
+                    rear_upload=rear_upload,
+                    hint=hint,
                 )
 
                 st.session_state.ai_result = result
@@ -649,16 +700,20 @@ if st.button("✨ Analyze with AI", use_container_width=True):
 
             except Exception as e:
                 st.markdown(
-                    f'<div class="error-box">AI analysis error: {e}</div>',
-                    unsafe_allow_html=True
+                    f'<div class="error-box">AI analysis error: {type(e).__name__}: {e}</div>',
+                    unsafe_allow_html=True,
                 )
 
 
 # =========================================================
 # RESULT SECTION
 # =========================================================
-df = st.session_state.result_df
-total = int(df["palletCount"].sum()) if not df.empty else 0
+df = st.session_state.result_df.copy()
+
+if "palletCount" in df.columns:
+    total = int(pd.to_numeric(df["palletCount"], errors="coerce").fillna(0).sum())
+else:
+    total = 0
 
 result = st.session_state.ai_result or {}
 explanation = result.get("countingExplanation", {})
@@ -667,7 +722,12 @@ summary = result.get("summary", {})
 confidence = result.get("confidence", "-")
 risk = summary.get("riskOfError", "-")
 
-st.markdown(f"""
+height_layers = safe_int(explanation.get("heightLayers", 0))
+width_columns = safe_int(explanation.get("widthColumns", 0))
+depth_rows = safe_int(explanation.get("depthRows", 0))
+
+st.markdown(
+    f"""
 <div class="result-header">
     <div>
         <div class="result-title">✨ ผล AI วิเคราะห์</div>
@@ -678,13 +738,12 @@ st.markdown(f"""
         <div class="result-num-label">พาเลทรวม</div>
     </div>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-height_layers = safe_int(explanation.get("heightLayers", 0))
-width_columns = safe_int(explanation.get("widthColumns", 0))
-depth_rows = safe_int(explanation.get("depthRows", 0))
-
-st.markdown(f"""
+st.markdown(
+    f"""
 <div class="info-card">
     <div style="font-size:13px;color:#888;margin-bottom:8px;">
         Counting Formula: Total Pallets = Height Layers × Width Columns × Depth Rows
@@ -704,20 +763,28 @@ st.markdown(f"""
         </div>
     </div>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-st.markdown(f"""
+st.markdown(
+    f"""
 <div class="total-bar">
     <span class="total-label">รวมทั้งหมด หลัง AI วิเคราะห์ / หลังแก้ไข</span>
     <span class="total-num">{total} พาเลท</span>
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-st.markdown("""
+st.markdown(
+    """
 <div class="note-box">
     ℹ️ User สามารถแก้ไขจำนวนพาเลทหรือสีพาเลทได้ก่อนกดยืนยันและบันทึกข้อมูล
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 # =========================================================
@@ -732,7 +799,7 @@ edited_df = st.data_editor(
     column_config={
         "imageFileName": st.column_config.TextColumn(
             "Image File Name",
-            disabled=False
+            disabled=False,
         ),
         "palletColor": st.column_config.SelectboxColumn(
             "Pallet Color",
@@ -744,18 +811,19 @@ edited_df = st.data_editor(
                 "black",
                 "green",
                 "other",
-                "unknown"
+                "unknown",
             ],
-            required=True
+            required=True,
         ),
         "palletCount": st.column_config.NumberColumn(
             "Pallet Count",
             min_value=0,
             max_value=999,
             step=1,
-            required=True
-        )
-    }
+            required=True,
+        ),
+    },
+    key="editable_result_table",
 )
 
 st.session_state.result_df = edited_df
@@ -787,7 +855,7 @@ with st.expander("ดูรายละเอียดการคำนวณ�
 with st.expander("Raw AI JSON"):
     st.code(
         json.dumps(result, indent=2, ensure_ascii=False) if result else "{}",
-        language="json"
+        language="json",
     )
 
 
@@ -797,7 +865,7 @@ with st.expander("Raw AI JSON"):
 reviewer_note = st.text_area(
     "Reviewer Note",
     placeholder="Add your note before saving...",
-    height=90
+    height=90,
 )
 
 b1, b2 = st.columns([1, 2])
@@ -810,6 +878,10 @@ with b1:
         )
         st.session_state.saved = False
         st.session_state.raw_json = ""
+
+        if "editable_result_table" in st.session_state:
+            del st.session_state["editable_result_table"]
+
         st.rerun()
 
 with b2:
@@ -819,36 +891,44 @@ with b2:
         if st.session_state.result_df.empty:
             st.markdown(
                 '<div class="error-box">ยังไม่มีข้อมูลสำหรับบันทึก กรุณากด Analyze with AI ก่อน</div>',
-                unsafe_allow_html=True
+                unsafe_allow_html=True,
             )
         else:
-            json_path, excel_path, final_total = save_reviewed_result(
-                st.session_state.result_df,
-                reviewer_note
-            )
-
-            st.session_state.saved = True
-
-            st.markdown(f"""
-            <div class="toast-success">
-                ✅ บันทึกข้อมูลสำเร็จ — รวม {final_total} พาเลท
-            </div>
-            """, unsafe_allow_html=True)
-
-            with open(json_path, "rb") as f:
-                st.download_button(
-                    label="Download JSON Result",
-                    data=f,
-                    file_name="pallet_final_result.json",
-                    mime="application/json",
-                    use_container_width=True
+            try:
+                json_text, excel_bytes, final_total = save_reviewed_result(
+                    st.session_state.result_df,
+                    reviewer_note,
                 )
 
-            with open(excel_path, "rb") as f:
+                st.session_state.saved = True
+
+                st.markdown(
+                    f"""
+                <div class="toast-success">
+                    ✅ บันทึกข้อมูลสำเร็จ — รวม {final_total} พาเลท
+                </div>
+                """,
+                    unsafe_allow_html=True,
+                )
+
+                st.download_button(
+                    label="Download JSON Result",
+                    data=json_text.encode("utf-8"),
+                    file_name="pallet_final_result.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+
                 st.download_button(
                     label="Download Excel Result",
-                    data=f,
+                    data=excel_bytes,
                     file_name="pallet_final_result.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    use_container_width=True,
+                )
+
+            except Exception as e:
+                st.markdown(
+                    f'<div class="error-box">Save error: {type(e).__name__}: {e}</div>',
+                    unsafe_allow_html=True,
                 )
