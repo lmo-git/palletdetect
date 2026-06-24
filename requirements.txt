@@ -1,6 +1,5 @@
 streamlit
-torch
-torchvision
-pillow
 pandas
+pillow
 openpyxl
+google-genai

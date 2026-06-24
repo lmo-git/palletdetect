@@ -1,462 +1,854 @@
-import streamlit as st
-import torch
-import torch.nn as nn
-from torchvision import transforms
-from PIL import Image, ImageDraw, ImageFilter
-import pandas as pd
-from io import BytesIO
-from datetime import datetime
-from pathlib import Path
+"""
+PalletVision — AI Pallet Counting App
+Streamlit Gradient Blue Design + Gemini AI Counting
+
+Run:
+pip install streamlit pandas pillow openpyxl google-genai
+streamlit run pallet_vision_app.py
+"""
+
 import os
+import json
+import tempfile
+from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+from PIL import Image
+from google import genai
+from google.genai import types
 
 
-st.set_page_config(page_title="Pallet Detection", layout="wide")
+# =========================================================
+# PAGE CONFIG
+# =========================================================
+st.set_page_config(
+    page_title="PalletVision",
+    page_icon="📦",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 
 
-# =========================
-# PATH
-# =========================
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "pallet_rnn_count.pt"
+# =========================================================
+# API KEY
+# =========================================================
+# Option 1: set directly here
+os.environ["GEMINI_API_KEY"] = ""
+
+# Option 2: use Streamlit secrets
+# os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
-# =========================
-# STYLE
-# =========================
+# =========================================================
+# PROMPT
+# =========================================================
+PALLET_PROMPT = """
+You are an expert AI visual inspector specializing in transport pallet logistics and inventory verification.
+
+You will receive exactly two images of the same truck load:
+1. Side view of the truck
+2. Rear view of the truck
+
+[GOAL]
+Accurately count the ACTUAL TOTAL number of transport pallets loaded on the truck by combining 3D spatial evidence from both images.
+
+[CRITICAL COUNTING LOGIC & DEFINITIONS]
+
+Total Pallets = Height Layers × Width Columns × Depth Rows
+
+1. Width Columns:
+   - Identify mainly from the REAR view.
+   - Count how many distinct vertical pallet stacks sit side-by-side across the truck width.
+   - Example: left stack and right stack = 2 width columns.
+
+2. Depth Rows:
+   - Identify mainly from the SIDE view.
+   - Count how many pallet stack positions extend along the truck length from rear to front.
+   - Example: only one stack position at the tail = 1 depth row.
+
+3. Height Layers:
+   - Double-check from BOTH side view and rear view.
+   - Count every individual pallet vertically from bottom to top.
+   - Do NOT only count large plastic blocks.
+   - Look carefully for:
+     - forklift entry gaps
+     - horizontal seams
+     - lip-to-lip contact lines
+     - nested pallet feet
+     - stacked pallet edges
+   - If pallets are nested or interlocked, still count each individual pallet.
+   - If user hint or ground truth specifies the exact structural height layer count, use it to calibrate the visual layer count.
+
+[STEP-BY-STEP INSTRUCTION]
+
+Step 1:
+Analyze the REAR view to determine Width Columns.
+
+Step 2:
+Analyze the SIDE view to determine Depth Rows and confirm cargo position.
+
+Step 3:
+Zoom in mentally on the stack in BOTH views.
+Count the exact number of individual pallets vertically as Height Layers.
+
+Step 4:
+Calculate:
+Total Pallets = Height Layers × Width Columns × Depth Rows
+
+[IMPORTANT RULES]
+
+- Count only actual transport pallets.
+- Do not count truck body, doors, floor, straps, shadows, wheels, license plates, background, boxes, documents, or empty truck space.
+- Do not use a fixed default quantity.
+- Do not assume 12, 28, or any fixed number unless the image structure supports it.
+- The side view and rear view are two views of the same truck load.
+- Do not double-count the same stack shown from different angles.
+- Final pallet count must be an integer.
+- Always set needHumanReview to true.
+- If all visible pallets are red, classify palletColor as red.
+- If multiple colors are visible, separate the result by color.
+- If color is unclear, use unknown.
+
+[OUTPUT REQUIREMENT]
+
+Return STRICT JSON only.
+Do not return markdown.
+Do not return explanation outside JSON.
+
+JSON shape:
+{
+  "ok": true,
+  "confidence": "high|medium|low",
+  "fileName": {
+    "sideViewImage": "",
+    "rearViewImage": "",
+    "combinedImageName": ""
+  },
+  "palletColor": "red|blue|white|wood|black|green|other|unknown",
+  "countingExplanation": {
+    "heightLayers": 0,
+    "heightLayersExplanation": "",
+    "widthColumns": 0,
+    "widthColumnsExplanation": "",
+    "depthRows": 0,
+    "depthRowsExplanation": "",
+    "formula": "",
+    "calculationMethod": ""
+  },
+  "summary": {
+    "totalPallets": 0,
+    "assumptions": "",
+    "riskOfError": "low|medium|high",
+    "needHumanReview": true
+  },
+  "resultRows": [
+    {
+      "imageFileName": "",
+      "palletColor": "red|blue|white|wood|black|green|other|unknown",
+      "palletCount": 0
+    }
+  ]
+}
+"""
+
+
+# =========================================================
+# CSS DESIGN
+# =========================================================
 st.markdown("""
 <style>
-.stApp {
-    background: #07111f;
-    color: #f8fafc;
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
 }
 
-h1, h2, h3, h4, h5, h6, p, label, span, div {
-    color: #f8fafc !important;
+#MainMenu, footer, header {
+    visibility: hidden;
 }
 
-input, textarea {
-    color: #000000 !important;
-    background-color: #ffffff !important;
+.block-container {
+    padding-top: 0 !important;
+    max-width: 820px;
 }
 
-[data-baseweb="select"] > div {
-    background-color: #000000 !important;
-    color: #ffffff !important;
-    border-radius: 12px !important;
-    border: 1px solid #444 !important;
+.topbar {
+    background: linear-gradient(135deg, #042C53 0%, #185FA5 60%, #378ADD 100%);
+    padding: 14px 24px;
+    border-radius: 0 0 16px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 22px;
 }
 
-[data-baseweb="select"] span {
-    color: #ffffff !important;
+.topbar-logo {
+    color: #fff;
+    font-size: 20px;
+    font-weight: 600;
 }
 
-div[role="listbox"] {
-    background-color: #000000 !important;
-    border: 1px solid #333 !important;
+.topbar-badge {
+    background: rgba(255,255,255,0.18);
+    color: #fff;
+    font-size: 12px;
+    padding: 5px 14px;
+    border-radius: 20px;
+    border: 1px solid rgba(255,255,255,0.30);
 }
 
-div[role="option"] {
-    background-color: #000000 !important;
-    color: #ffffff !important;
+.stepbar {
+    background: linear-gradient(90deg, #0C447C, #185FA5);
+    padding: 11px 24px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 22px;
+    font-size: 13px;
+    color: rgba(255,255,255,0.60);
 }
 
-div[role="option"]:hover {
-    background-color: #1f2937 !important;
-    color: #38f8a6 !important;
+.step-active {
+    color: #fff;
+    font-weight: 500;
 }
 
-[data-testid="stFileUploader"] section {
-    border: 2px solid #000000 !important;
-    border-radius: 14px !important;
-    background: #f8fafc !important;
+.step-done {
+    background: #378ADD;
+    color: #fff;
+    width: 21px;
+    height: 21px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
 }
 
-[data-testid="stFileUploader"] section * {
-    color: #000000 !important;
+.step-circle-active {
+    background: #fff;
+    color: #185FA5;
+    width: 21px;
+    height: 21px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 600;
 }
 
-[data-testid="stFileUploader"] button {
-    color: #000000 !important;
-    border: 1px solid #000000 !important;
-    background: #ffffff !important;
+.step-circle {
+    background: rgba(255,255,255,0.15);
+    color: rgba(255,255,255,0.70);
+    width: 21px;
+    height: 21px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
 }
 
-.main-card {
-    background: linear-gradient(180deg, #111d33 0%, #0a1222 100%);
-    border-radius: 26px;
-    padding: 24px;
-    border: 1px solid #2b456d;
-    box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+.step-sep {
+    flex: 1;
+    height: 1px;
+    background: rgba(255,255,255,0.25);
 }
 
-.metric-card {
-    background: #16243d;
-    border-radius: 18px;
-    padding: 18px;
-    border: 1px solid #2b456d;
+.upload-label-box {
+    background: linear-gradient(135deg, #E6F1FB, #B5D4F4);
+    border: 2px solid #185FA5;
+    border-radius: 14px;
+    padding: 13px 16px;
+    text-align: center;
+    color: #0C447C;
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 6px;
+}
+
+.result-header {
+    background: linear-gradient(135deg, #042C53 0%, #185FA5 100%);
+    border-radius: 14px 14px 0 0;
+    padding: 18px 22px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.result-title {
+    color: #fff;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.result-sub {
+    color: #B5D4F4;
+    font-size: 12px;
+    margin-top: 4px;
+}
+
+.result-num {
+    color: #fff;
+    font-size: 42px;
+    font-weight: 600;
+    text-align: right;
+    line-height: 1;
+}
+
+.result-num-label {
+    color: #B5D4F4;
+    font-size: 12px;
+    text-align: right;
+    margin-top: 3px;
+}
+
+.info-card {
+    background: white;
+    border-left: 1px solid #B5D4F4;
+    border-right: 1px solid #B5D4F4;
+    padding: 16px 22px;
+}
+
+.info-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10px;
+    margin-top: 8px;
+}
+
+.metric-box {
+    background: #E6F1FB;
+    border-radius: 12px;
+    padding: 12px;
     text-align: center;
 }
 
-.big-number {
-    font-size: 46px;
-    font-weight: 800;
-    color: #38f8a6 !important;
+.metric-label {
+    color: #5F5E5A;
+    font-size: 12px;
 }
 
-.label {
-    color: #b7c7e6 !important;
+.metric-value {
+    color: #185FA5;
+    font-size: 22px;
+    font-weight: 600;
+    margin-top: 3px;
+}
+
+.total-bar {
+    background: #F0F4F8;
+    border: 1px solid #B5D4F4;
+    border-radius: 0 0 14px 14px;
+    padding: 12px 22px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.total-label {
+    color: #5F5E5A;
+    font-size: 13px;
+}
+
+.total-num {
+    color: #185FA5;
+    font-size: 21px;
+    font-weight: 600;
+}
+
+.note-box {
+    background: #E6F1FB;
+    border-left: 4px solid #378ADD;
+    border-radius: 0 10px 10px 0;
+    padding: 11px 15px;
+    font-size: 13px;
+    color: #0C447C;
+    margin: 14px 0;
+}
+
+.toast-success {
+    background: linear-gradient(135deg, #0F6E56, #1D9E75);
+    color: #fff;
+    border-radius: 12px;
+    padding: 13px 18px;
     font-size: 14px;
-    letter-spacing: 1px;
+    font-weight: 500;
+    margin-top: 12px;
 }
 
-.stButton > button {
-    background: #22c55e;
-    color: white !important;
-    border-radius: 16px;
-    height: 52px;
-    border: none;
-    font-weight: 700;
+.error-box {
+    background: #FDEAEA;
+    border-left: 4px solid #E24B4A;
+    border-radius: 0 10px 10px 0;
+    padding: 11px 15px;
+    font-size: 13px;
+    color: #8A1F1F;
+    margin: 14px 0;
 }
+
+div[data-testid="stButton"] > button {
+    border-radius: 10px !important;
+    font-size: 14px !important;
+    font-weight: 600 !important;
+    padding: 11px 18px !important;
+}
+
+div[data-testid="stButton"] > button:hover {
+    opacity: 0.92 !important;
+}
+
+div[data-testid="stDataFrame"] {
+    border-radius: 12px;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
 
-# =========================
-# MODEL CLASS
-# =========================
-class PalletRNNCounter(nn.Module):
-    def __init__(self):
-        super().__init__()
+# =========================================================
+# SESSION STATE
+# =========================================================
+if "ai_result" not in st.session_state:
+    st.session_state.ai_result = None
 
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+if "result_df" not in st.session_state:
+    st.session_state.result_df = pd.DataFrame(
+        columns=["imageFileName", "palletColor", "palletCount"]
+    )
 
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+if "saved" not in st.session_state:
+    st.session_state.saved = False
 
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-        )
-
-        self.rnn = nn.GRU(
-            input_size=64 * 28,
-            hidden_size=128,
-            batch_first=True,
-            bidirectional=True
-        )
-
-        self.fc = nn.Sequential(
-            nn.Linear(128 * 2, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        x = self.cnn(x)
-
-        b, c, h, w = x.shape
-
-        x = x.permute(0, 2, 1, 3)
-        x = x.reshape(b, h, c * w)
-
-        out, _ = self.rnn(x)
-
-        return self.fc(out[:, -1, :])
+if "raw_json" not in st.session_state:
+    st.session_state.raw_json = ""
 
 
-# =========================
-# LOAD MODEL
-# =========================
-@st.cache_resource
-def load_model():
-    if not MODEL_PATH.exists():
-        st.error(f"ไม่พบไฟล์ model: {MODEL_PATH}")
-        st.write("Current Directory:", os.getcwd())
-        st.write("BASE_DIR:", BASE_DIR)
-        st.write("Files in BASE_DIR:", [f.name for f in BASE_DIR.iterdir()])
-        st.stop()
-
-    model = PalletRNNCounter()
-
+# =========================================================
+# HELPER FUNCTIONS
+# =========================================================
+def safe_int(value, default=0):
     try:
-        state_dict = torch.load(MODEL_PATH, map_location="cpu")
-        model.load_state_dict(state_dict)
-    except Exception as e:
-        st.error("โหลด model ไม่สำเร็จ")
-        st.exception(e)
-        st.stop()
-
-    model.eval()
-    return model
+        return int(value)
+    except Exception:
+        return default
 
 
-model = load_model()
+def normalize_result_rows(result, combined_file_name):
+    summary = result.get("summary", {})
+    explanation = result.get("countingExplanation", {})
+
+    height = safe_int(explanation.get("heightLayers", 0))
+    width = safe_int(explanation.get("widthColumns", 0))
+    depth = safe_int(explanation.get("depthRows", 0))
+
+    calculated_total = height * width * depth
+    ai_total = safe_int(summary.get("totalPallets", calculated_total))
+
+    rows = result.get("resultRows", [])
+
+    if not rows:
+        rows = [
+            {
+                "imageFileName": combined_file_name,
+                "palletColor": result.get("palletColor", "unknown"),
+                "palletCount": ai_total
+            }
+        ]
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        df = pd.DataFrame(columns=["imageFileName", "palletColor", "palletCount"])
+
+    if "imageFileName" not in df.columns:
+        df["imageFileName"] = combined_file_name
+
+    if "palletColor" not in df.columns:
+        df["palletColor"] = result.get("palletColor", "unknown")
+
+    if "palletCount" not in df.columns:
+        df["palletCount"] = ai_total
+
+    df["imageFileName"] = df["imageFileName"].fillna("").replace("", combined_file_name)
+    df["palletColor"] = df["palletColor"].fillna("unknown").replace("", "unknown")
+    df["palletCount"] = pd.to_numeric(df["palletCount"], errors="coerce").fillna(0).astype(int)
+
+    return df[["imageFileName", "palletColor", "palletCount"]]
 
 
-# =========================
-# TRANSFORM
-# =========================
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+def analyze_pallets_with_gemini(side_upload, rear_upload, hint):
+    side_file_name = side_upload.name
+    rear_file_name = rear_upload.name
+    combined_file_name = f"{side_file_name} + {rear_file_name}"
 
+    side_img = Image.open(side_upload)
+    rear_img = Image.open(rear_upload)
 
-# =========================
-# SESSION
-# =========================
-if "records" not in st.session_state:
-    st.session_state.records = []
-
-
-# =========================
-# FUNCTIONS
-# =========================
-def predict_count(image):
-    tensor = transform(image.convert("RGB")).unsqueeze(0)
-
-    with torch.no_grad():
-        pred = model(tensor).item()
-
-    return pred, max(0, round(pred))
-
-
-def draw_dashed_line(draw, start, end, fill, width=4, dash_length=22, gap_length=12):
-    x1, y1 = start
-    x2, y2 = end
-
-    total_len = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-
-    if total_len == 0:
-        return
-
-    dx = (x2 - x1) / total_len
-    dy = (y2 - y1) / total_len
-
-    dist = 0
-
-    while dist < total_len:
-        dash_end = min(dist + dash_length, total_len)
-
-        sx = x1 + dx * dist
-        sy = y1 + dy * dist
-        ex = x1 + dx * dash_end
-        ey = y1 + dy * dash_end
-
-        draw.line([(sx, sy), (ex, ey)], fill=fill, width=width)
-
-        dist += dash_length + gap_length
-
-
-def draw_measurement_overlay(image, count):
-    img = image.copy().convert("RGB")
-
-    blue_overlay = Image.new("RGB", img.size, (0, 130, 200))
-    img = Image.blend(img, blue_overlay, 0.10)
-    img = img.filter(ImageFilter.SHARPEN)
-
-    draw = ImageDraw.Draw(img)
-
-    w, h = img.size
-
-    if count <= 0:
-        return img
-
-    x1 = int(w * 0.18)
-    x2 = int(w * 0.82)
-
-    top_margin = int(h * 0.14)
-    bottom_margin = int(h * 0.88)
-
-    area_height = bottom_margin - top_margin
-    step = area_height / count
-
-    yellow = (255, 220, 60)
-
-    for i in range(count):
-        y = int(top_margin + step * i + step / 2)
-
-        draw_dashed_line(
-            draw=draw,
-            start=(x1, y),
-            end=(x2, y),
-            fill=yellow,
-            width=4
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            PALLET_PROMPT,
+            f"Side view image filename: {side_file_name}",
+            f"Rear view image filename: {rear_file_name}",
+            f"Combined image filename: {combined_file_name}",
+            f"Additional user hint: {hint or 'No additional context.'}",
+            "Image angle: side view",
+            side_img,
+            "Image angle: rear view",
+            rear_img
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0,
+            max_output_tokens=2048,
+            response_mime_type="application/json"
         )
+    )
 
-        draw.text(
-            (x1 - 55, y - 12),
-            f"#{i + 1}",
-            fill=yellow
-        )
+    raw_text = response.text
+    result = json.loads(raw_text)
+    df = normalize_result_rows(result, combined_file_name)
 
-    return img
-
-
-def to_excel(df):
-    output = BytesIO()
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(
-            writer,
-            index=False,
-            sheet_name="Pallet Count"
-        )
-
-    return output.getvalue()
+    return result, df, raw_text
 
 
-# =========================
-# UI
-# =========================
-st.title("Pallet Detection")
+def save_reviewed_result(df, reviewer_note):
+    df = pd.DataFrame(df)
 
-st.caption(
-    "Upload/ถ่ายรูป → RNN Predict → ปรับความแม่นยำ → แสดงเส้นวัดสีเหลือง → Confirm → Export Excel"
+    df["palletCount"] = pd.to_numeric(
+        df["palletCount"],
+        errors="coerce"
+    ).fillna(0).astype(int)
+
+    final_total = int(df["palletCount"].sum())
+
+    final_result = {
+        "reviewedByUser": True,
+        "savedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "finalTotalPallets": final_total,
+        "reviewerNote": reviewer_note or "",
+        "resultRows": df.to_dict(orient="records"),
+        "aiRawResult": st.session_state.ai_result
+    }
+
+    json_path = "pallet_final_result.json"
+    excel_path = "pallet_final_result.xlsx"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(final_result, f, indent=2, ensure_ascii=False)
+
+    df.to_excel(excel_path, index=False)
+
+    return json_path, excel_path, final_total
+
+
+# =========================================================
+# TOP BAR
+# =========================================================
+st.markdown("""
+<div class="topbar">
+    <div class="topbar-logo">📦 PalletVision</div>
+    <div class="topbar-badge">AI Counting</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# STEP BAR
+# =========================================================
+st.markdown("""
+<div class="stepbar">
+    <span class="step-done">1</span>
+    <span class="step-active">เลือกรูปภาพ</span>
+    <div class="step-sep"></div>
+    <span class="step-circle-active">2</span>
+    <span class="step-active">AI วิเคราะห์</span>
+    <div class="step-sep"></div>
+    <span class="step-circle">3</span>
+    <span>ยืนยันและบันทึก</span>
+</div>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# UPLOAD SECTION
+# =========================================================
+col1, col2 = st.columns(2)
+
+with col1:
+    st.markdown(
+        '<div class="upload-label-box">📷 ด้านข้างรถบรรทุก<br>Side View</div>',
+        unsafe_allow_html=True
+    )
+    side_upload = st.file_uploader(
+        "Upload side view",
+        type=["jpg", "jpeg", "png"],
+        key="side_upload",
+        label_visibility="collapsed"
+    )
+
+    if side_upload:
+        st.image(side_upload, use_container_width=True)
+
+with col2:
+    st.markdown(
+        '<div class="upload-label-box">📷 ด้านหลังรถบรรทุก<br>Rear View</div>',
+        unsafe_allow_html=True
+    )
+    rear_upload = st.file_uploader(
+        "Upload rear view",
+        type=["jpg", "jpeg", "png"],
+        key="rear_upload",
+        label_visibility="collapsed"
+    )
+
+    if rear_upload:
+        st.image(rear_upload, use_container_width=True)
+
+
+hint = st.text_area(
+    "Optional Hint",
+    value=(
+        "Use 3D pallet counting formula: Total Pallets = Height Layers × Width Columns × Depth Rows. "
+        "Rear view identifies Width Columns. Side view identifies Depth Rows. "
+        "Both views confirm Height Layers."
+    ),
+    height=90
 )
 
-with st.expander("Debug Model Path", expanded=False):
-    st.write("Current Directory:", os.getcwd())
-    st.write("BASE_DIR:", str(BASE_DIR))
-    st.write("MODEL_PATH:", str(MODEL_PATH))
-    st.write("MODEL EXISTS:", MODEL_PATH.exists())
-    st.write("MODEL SIZE MB:", round(MODEL_PATH.stat().st_size / 1024 / 1024, 2) if MODEL_PATH.exists() else None)
 
-
-with st.container():
-    st.markdown('<div class="main-card">', unsafe_allow_html=True)
-
-    top1, top2 = st.columns([1, 1])
-
-    with top1:
-        weight_ticket = st.text_input("เลขตั๋วชั่ง")
-
-    with top2:
-        image_source = st.radio(
-            "เลือกวิธีนำเข้ารูป",
-            ["Upload รูปภาพ", "ถ่ายรูปจากกล้อง"],
-            horizontal=True,
-            index=0
-        )
-
-    uploaded_image = None
-
-    if image_source == "Upload รูปภาพ":
-        uploaded_image = st.file_uploader(
-            "Upload รูปพาเลท",
-            type=["jpg", "jpeg", "png"]
+# =========================================================
+# ANALYZE BUTTON
+# =========================================================
+if st.button("✨ Analyze with AI", use_container_width=True):
+    if not side_upload or not rear_upload:
+        st.markdown(
+            '<div class="error-box">กรุณาอัปโหลดรูปภาพทั้ง 2 มุม: ด้านข้าง และ ด้านหลัง</div>',
+            unsafe_allow_html=True
         )
     else:
-        uploaded_image = st.camera_input("ถ่ายรูปพาเลท")
+        with st.spinner("AI กำลังวิเคราะห์จำนวนพาเลท..."):
+            try:
+                result, df, raw_json = analyze_pallets_with_gemini(
+                    side_upload,
+                    rear_upload,
+                    hint
+                )
 
-    if uploaded_image is not None:
-        image = Image.open(uploaded_image).convert("RGB")
+                st.session_state.ai_result = result
+                st.session_state.result_df = df
+                st.session_state.raw_json = raw_json
+                st.session_state.saved = False
 
-        raw_pred, base_count = predict_count(image)
+                st.success("AI วิเคราะห์เสร็จแล้ว")
 
-        img_col, side_col = st.columns([2.2, 1])
+            except Exception as e:
+                st.markdown(
+                    f'<div class="error-box">AI analysis error: {e}</div>',
+                    unsafe_allow_html=True
+                )
 
-        with side_col:
-            st.markdown("### Accuracy")
 
-            accuracy_slider = st.slider(
-                "ปรับความแม่นยำ",
-                min_value=0.50,
-                max_value=1.50,
-                value=1.00,
-                step=0.01
-            )
+# =========================================================
+# RESULT SECTION
+# =========================================================
+df = st.session_state.result_df
+total = int(df["palletCount"].sum()) if not df.empty else 0
 
-            adjusted_count = max(0, round(raw_pred * accuracy_slider))
+result = st.session_state.ai_result or {}
+explanation = result.get("countingExplanation", {})
+summary = result.get("summary", {})
 
+confidence = result.get("confidence", "-")
+risk = summary.get("riskOfError", "-")
+
+st.markdown(f"""
+<div class="result-header">
+    <div>
+        <div class="result-title">✨ ผล AI วิเคราะห์</div>
+        <div class="result-sub">Confidence: {confidence} · Risk of Error: {risk}</div>
+    </div>
+    <div>
+        <div class="result-num">{total}</div>
+        <div class="result-num-label">พาเลทรวม</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+height_layers = safe_int(explanation.get("heightLayers", 0))
+width_columns = safe_int(explanation.get("widthColumns", 0))
+depth_rows = safe_int(explanation.get("depthRows", 0))
+
+st.markdown(f"""
+<div class="info-card">
+    <div style="font-size:13px;color:#888;margin-bottom:8px;">
+        Counting Formula: Total Pallets = Height Layers × Width Columns × Depth Rows
+    </div>
+    <div class="info-grid">
+        <div class="metric-box">
+            <div class="metric-label">Height Layers</div>
+            <div class="metric-value">{height_layers}</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-label">Width Columns</div>
+            <div class="metric-value">{width_columns}</div>
+        </div>
+        <div class="metric-box">
+            <div class="metric-label">Depth Rows</div>
+            <div class="metric-value">{depth_rows}</div>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown(f"""
+<div class="total-bar">
+    <span class="total-label">รวมทั้งหมด หลัง AI วิเคราะห์ / หลังแก้ไข</span>
+    <span class="total-num">{total} พาเลท</span>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="note-box">
+    ℹ️ User สามารถแก้ไขจำนวนพาเลทหรือสีพาเลทได้ก่อนกดยืนยันและบันทึกข้อมูล
+</div>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# EDITABLE TABLE
+# =========================================================
+st.subheader("Result Table")
+
+edited_df = st.data_editor(
+    df,
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config={
+        "imageFileName": st.column_config.TextColumn(
+            "Image File Name",
+            disabled=False
+        ),
+        "palletColor": st.column_config.SelectboxColumn(
+            "Pallet Color",
+            options=[
+                "red",
+                "blue",
+                "white",
+                "wood",
+                "black",
+                "green",
+                "other",
+                "unknown"
+            ],
+            required=True
+        ),
+        "palletCount": st.column_config.NumberColumn(
+            "Pallet Count",
+            min_value=0,
+            max_value=999,
+            step=1,
+            required=True
+        )
+    }
+)
+
+st.session_state.result_df = edited_df
+
+
+# =========================================================
+# COUNTING EXPLANATION
+# =========================================================
+with st.expander("ดูรายละเอียดการคำนวณของ AI"):
+    st.write("Height Layers Explanation:")
+    st.write(explanation.get("heightLayersExplanation", "-"))
+
+    st.write("Width Columns Explanation:")
+    st.write(explanation.get("widthColumnsExplanation", "-"))
+
+    st.write("Depth Rows Explanation:")
+    st.write(explanation.get("depthRowsExplanation", "-"))
+
+    st.write("Formula:")
+    st.write(explanation.get("formula", "-"))
+
+    st.write("Calculation Method:")
+    st.write(explanation.get("calculationMethod", "-"))
+
+    st.write("Assumptions:")
+    st.write(summary.get("assumptions", "-"))
+
+
+with st.expander("Raw AI JSON"):
+    st.code(
+        json.dumps(result, indent=2, ensure_ascii=False) if result else "{}",
+        language="json"
+    )
+
+
+# =========================================================
+# SAVE SECTION
+# =========================================================
+reviewer_note = st.text_area(
+    "Reviewer Note",
+    placeholder="Add your note before saving...",
+    height=90
+)
+
+b1, b2 = st.columns([1, 2])
+
+with b1:
+    if st.button("🔄 เริ่มใหม่", use_container_width=True):
+        st.session_state.ai_result = None
+        st.session_state.result_df = pd.DataFrame(
+            columns=["imageFileName", "palletColor", "palletCount"]
+        )
+        st.session_state.saved = False
+        st.session_state.raw_json = ""
+        st.rerun()
+
+with b2:
+    label = "✅ บันทึกแล้ว" if st.session_state.saved else "💾 ยืนยันและบันทึกข้อมูล"
+
+    if st.button(label, use_container_width=True):
+        if st.session_state.result_df.empty:
             st.markdown(
-                f"""
-                <div class="metric-card">
-                    <div class="big-number">{adjusted_count}</div>
-                    <div class="label">PALLET FOUND</div>
-                </div>
-                """,
+                '<div class="error-box">ยังไม่มีข้อมูลสำหรับบันทึก กรุณากด Analyze with AI ก่อน</div>',
                 unsafe_allow_html=True
             )
-
-            st.metric("Raw Prediction", f"{raw_pred:.2f}")
-            st.metric("Model Count", base_count)
-
-            pallet_type = st.selectbox(
-                "Confirm ประเภทพาเลท",
-                [
-                    "Red Pallet",
-                    "CHEP",
-                    "Plastic Pallet",
-                    "Wooden Pallet",
-                    "Unknown"
-                ]
+        else:
+            json_path, excel_path, final_total = save_reviewed_result(
+                st.session_state.result_df,
+                reviewer_note
             )
 
-            confirmed_count = st.number_input(
-                "Confirm จำนวนพาเลท",
-                min_value=0,
-                value=int(adjusted_count),
-                step=1
-            )
+            st.session_state.saved = True
 
-            remark = st.text_area("Remark")
+            st.markdown(f"""
+            <div class="toast-success">
+                ✅ บันทึกข้อมูลสำเร็จ — รวม {final_total} พาเลท
+            </div>
+            """, unsafe_allow_html=True)
 
-        highlighted_img = draw_measurement_overlay(
-            image=image,
-            count=int(adjusted_count)
-        )
+            with open(json_path, "rb") as f:
+                st.download_button(
+                    label="Download JSON Result",
+                    data=f,
+                    file_name="pallet_final_result.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
 
-        with img_col:
-            st.image(
-                highlighted_img,
-                caption="Measurement Overlay",
-                use_container_width=True
-            )
-
-        if st.button("บันทึกผลตรวจ", type="primary"):
-            if weight_ticket.strip() == "":
-                st.error("กรุณากรอกเลขตั๋วชั่ง")
-            else:
-                record = {
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "weight_ticket": weight_ticket,
-                    "model_path": str(MODEL_PATH),
-                    "model_type": "CNN + GRU/RNN Regression",
-                    "raw_prediction": round(raw_pred, 3),
-                    "model_count": base_count,
-                    "accuracy_slider": accuracy_slider,
-                    "adjusted_count": adjusted_count,
-                    "confirmed_count": confirmed_count,
-                    "pallet_type": pallet_type,
-                    "remark": remark,
-                }
-
-                st.session_state.records.append(record)
-                st.success("บันทึกข้อมูลเรียบร้อย")
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# =========================
-# HISTORY
-# =========================
-st.markdown("## History")
-
-if len(st.session_state.records) > 0:
-    df = pd.DataFrame(st.session_state.records)
-
-    st.dataframe(df, use_container_width=True)
-
-    st.download_button(
-        label="Download Excel",
-        data=to_excel(df),
-        file_name="pallet_detection_result.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-else:
-    st.info("ยังไม่มีข้อมูลที่บันทึก")
+            with open(excel_path, "rb") as f:
+                st.download_button(
+                    label="Download Excel Result",
+                    data=f,
+                    file_name="pallet_final_result.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
