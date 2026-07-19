@@ -128,6 +128,8 @@ Total Pallets = Height Layers × Width Columns × Depth Rows
 - If all visible pallets are red, classify palletColor as red.
 - If multiple colors are visible, separate the result by color.
 - If color is unclear, use unknown.
+- Keep all explanation text concise. Each explanation field must be no more than 20 words.
+- Complete and close the entire JSON object before ending the response.
 
 [OUTPUT REQUIREMENT]
 
@@ -586,6 +588,61 @@ def safe_int(value, default=0):
         return default
 
 
+def extract_json_object(raw_text):
+    """Parse the first complete JSON object returned by the model.
+
+    Gemini normally follows response_mime_type="application/json", but a response
+    can still contain Markdown fences, leading text, or be truncated. This helper
+    accepts harmless wrappers while rejecting incomplete JSON so the caller can
+    retry the AI request instead of saving a corrupted result.
+    """
+    if raw_text is None or not str(raw_text).strip():
+        raise ValueError("AI returned an empty response")
+
+    cleaned = str(raw_text).strip()
+
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    json_start = cleaned.find("{")
+    if json_start < 0:
+        raise ValueError("AI response does not contain a JSON object")
+
+    candidate = cleaned[json_start:]
+    decoder = json.JSONDecoder()
+
+    try:
+        parsed, end_position = decoder.raw_decode(candidate)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "AI returned incomplete or invalid JSON "
+            f"({exc.msg} at line {exc.lineno}, column {exc.colno})"
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("AI JSON result must be an object")
+
+    normalized_json = candidate[:end_position]
+    return parsed, normalized_json
+
+
+def get_finish_reason(response):
+    """Return Gemini finish reason without depending on SDK object details."""
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return "unknown"
+        finish_reason = getattr(candidates[0], "finish_reason", None)
+        return str(finish_reason or "unknown")
+    except Exception:
+        return "unknown"
+
+
 def map_pallet_type(pallet_color):
     """Map the AI-detected pallet color to the default business pallet type."""
     normalized_color = str(pallet_color or "unknown").strip().lower()
@@ -686,58 +743,84 @@ def analyze_pallets_with_gemini(side_upload, rear_upload, hint, transaction_no):
     )
     combined_file_name = f"{side_file_name} + {rear_file_name}"
 
-    # camera_input and file_uploader both return file-like UploadedFile objects.
+    # Detach PIL images from UploadedFile streams so retries can safely reuse them.
     side_upload.seek(0)
     rear_upload.seek(0)
-    side_img = Image.open(side_upload)
-    rear_img = Image.open(rear_upload)
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            PALLET_PROMPT,
-            f"Transaction number: {transaction_no}",
-            f"Side view image filename: {side_file_name}",
-            f"Rear view image filename: {rear_file_name}",
-            f"Combined image filename: {combined_file_name}",
-            f"Additional user hint: {hint or 'No additional context.'}",
-            "Image angle: side view",
-            side_img,
-            "Image angle: rear view",
-            rear_img,
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0,
-            max_output_tokens=2048,
-            response_mime_type="application/json",
-        ),
-    )
+    with Image.open(side_upload) as image:
+        side_img = image.convert("RGB").copy()
 
-    raw_text = response.text
+    with Image.open(rear_upload) as image:
+        rear_img = image.convert("RGB").copy()
 
-    try:
-        result = json.loads(raw_text)
-    except Exception:
-        cleaned = raw_text.strip()
+    base_contents = [
+        PALLET_PROMPT,
+        f"Transaction number: {transaction_no}",
+        f"Side view image filename: {side_file_name}",
+        f"Rear view image filename: {rear_file_name}",
+        f"Combined image filename: {combined_file_name}",
+        f"Additional user hint: {hint or 'No additional context.'}",
+        "Image angle: side view",
+        side_img,
+        "Image angle: rear view",
+        rear_img,
+    ]
 
-        if cleaned.startswith("```json"):
-            cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-        elif cleaned.startswith("```"):
-            cleaned = cleaned.replace("```", "").strip()
+    max_attempts = 3
+    last_error = None
+    last_raw_text = ""
+    last_finish_reason = "unknown"
 
-        result = json.loads(cleaned)
-        raw_text = cleaned
+    for attempt in range(1, max_attempts + 1):
+        retry_instruction = ""
 
-    # Always retain the real filenames used by this transaction, even when the
-    # model returns blank or altered filename fields.
-    result.setdefault("fileName", {})
-    result["fileName"]["sideViewImage"] = side_file_name
-    result["fileName"]["rearViewImage"] = rear_file_name
-    result["fileName"]["combinedImageName"] = combined_file_name
+        if attempt > 1:
+            retry_instruction = (
+                "IMPORTANT RETRY: The previous response was incomplete or invalid JSON. "
+                "Return exactly one COMPLETE and COMPACT JSON object. "
+                "Do not use Markdown. Do not add text before or after the JSON. "
+                "Keep every explanation field under 20 words. "
+                "Close every string, array, and object before finishing."
+            )
 
-    df = normalize_result_rows(result, combined_file_name)
+        contents = list(base_contents)
+        if retry_instruction:
+            contents.insert(1, retry_instruction)
 
-    return result, df, raw_text
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    # A larger limit reduces the chance that detailed JSON is cut off.
+                    max_output_tokens=4096,
+                    response_mime_type="application/json",
+                ),
+            )
+
+            last_raw_text = getattr(response, "text", "") or ""
+            last_finish_reason = get_finish_reason(response)
+            result, normalized_json = extract_json_object(last_raw_text)
+
+            # Always retain the actual filenames from this transaction.
+            result.setdefault("fileName", {})
+            result["fileName"]["sideViewImage"] = side_file_name
+            result["fileName"]["rearViewImage"] = rear_file_name
+            result["fileName"]["combinedImageName"] = combined_file_name
+
+            df = normalize_result_rows(result, combined_file_name)
+            return result, df, normalized_json
+
+        except Exception as exc:
+            last_error = exc
+
+    raw_preview = last_raw_text[:300].replace("\n", " ").strip()
+    raise ValueError(
+        "Gemini returned invalid or incomplete JSON after "
+        f"{max_attempts} attempts. Finish reason: {last_finish_reason}. "
+        f"Last error: {last_error}. Response preview: {raw_preview!r}"
+    ) from last_error
 
 
 def validate_result_df(df):
