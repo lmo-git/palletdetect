@@ -9,6 +9,7 @@ streamlit run pallet_vision_app.py
 
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -427,29 +428,80 @@ div[data-testid="stButton"] > button:hover {
 # =========================================================
 # SESSION STATE
 # =========================================================
+CURRENT_COLUMNS = ["imageFileName", "palletColor", "palletCount"]
+BATCH_COLUMNS = [
+    "transactionNo",
+    "savedAt",
+    "reviewerNote",
+    "sideViewImage",
+    "rearViewImage",
+    "confidence",
+    "riskOfError",
+    "imageFileName",
+    "palletColor",
+    "palletCount",
+]
+
 if "ai_result" not in st.session_state:
     st.session_state.ai_result = None
 
 if "result_df" not in st.session_state:
-    st.session_state.result_df = pd.DataFrame(
-        columns=["imageFileName", "palletColor", "palletCount"]
-    )
-
-if "saved" not in st.session_state:
-    st.session_state.saved = False
+    st.session_state.result_df = pd.DataFrame(columns=CURRENT_COLUMNS)
 
 if "raw_json" not in st.session_state:
     st.session_state.raw_json = ""
+
+if "batch_transactions" not in st.session_state:
+    st.session_state.batch_transactions = []
+
+if "batch_df" not in st.session_state:
+    st.session_state.batch_df = pd.DataFrame(columns=BATCH_COLUMNS)
+
+if "transaction_no" not in st.session_state:
+    st.session_state.transaction_no = 1
+
+if "widget_version" not in st.session_state:
+    st.session_state.widget_version = 0
+
+if "download_json" not in st.session_state:
+    st.session_state.download_json = None
+
+if "download_excel" not in st.session_state:
+    st.session_state.download_excel = None
+
+if "download_total" not in st.session_state:
+    st.session_state.download_total = 0
+
+if "download_transaction_count" not in st.session_state:
+    st.session_state.download_transaction_count = 0
+
+if "flash_message" not in st.session_state:
+    st.session_state.flash_message = ""
 
 
 # =========================================================
 # HELPER FUNCTIONS
 # =========================================================
+def now_bangkok():
+    return datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def safe_int(value, default=0):
     try:
         return int(value)
     except Exception:
         return default
+
+
+def safe_uploaded_name(upload, fallback_name):
+    file_name = getattr(upload, "name", "") or fallback_name
+
+    # Camera input commonly returns a generic file name. Rename it by transaction
+    # so that side and rear images are distinguishable in the exported result.
+    if file_name.lower() in {"camera_image.jpg", "camera_image.jpeg", "camera_image.png"}:
+        return fallback_name
+
+    return file_name
 
 
 def normalize_result_rows(result, combined_file_name):
@@ -477,7 +529,7 @@ def normalize_result_rows(result, combined_file_name):
     df = pd.DataFrame(rows)
 
     if df.empty:
-        df = pd.DataFrame(columns=["imageFileName", "palletColor", "palletCount"])
+        df = pd.DataFrame(columns=CURRENT_COLUMNS)
 
     if "imageFileName" not in df.columns:
         df["imageFileName"] = combined_file_name
@@ -490,20 +542,28 @@ def normalize_result_rows(result, combined_file_name):
 
     df["imageFileName"] = df["imageFileName"].fillna("").replace("", combined_file_name)
     df["palletColor"] = df["palletColor"].fillna("unknown").replace("", "unknown")
-
     df["palletCount"] = pd.to_numeric(
         df["palletCount"],
-        errors="coerce"
+        errors="coerce",
     ).fillna(0).astype(int)
 
-    return df[["imageFileName", "palletColor", "palletCount"]]
+    return df[CURRENT_COLUMNS]
 
 
-def analyze_pallets_with_gemini(side_upload, rear_upload, hint):
-    side_file_name = side_upload.name
-    rear_file_name = rear_upload.name
+def analyze_pallets_with_gemini(side_upload, rear_upload, hint, transaction_no):
+    side_file_name = safe_uploaded_name(
+        side_upload,
+        f"transaction_{transaction_no:03d}_side.jpg",
+    )
+    rear_file_name = safe_uploaded_name(
+        rear_upload,
+        f"transaction_{transaction_no:03d}_rear.jpg",
+    )
     combined_file_name = f"{side_file_name} + {rear_file_name}"
 
+    # camera_input and file_uploader both return file-like UploadedFile objects.
+    side_upload.seek(0)
+    rear_upload.seek(0)
     side_img = Image.open(side_upload)
     rear_img = Image.open(rear_upload)
 
@@ -511,6 +571,7 @@ def analyze_pallets_with_gemini(side_upload, rear_upload, hint):
         model="gemini-2.5-flash",
         contents=[
             PALLET_PROMPT,
+            f"Transaction number: {transaction_no}",
             f"Side view image filename: {side_file_name}",
             f"Rear view image filename: {rear_file_name}",
             f"Combined image filename: {combined_file_name}",
@@ -542,52 +603,213 @@ def analyze_pallets_with_gemini(side_upload, rear_upload, hint):
         result = json.loads(cleaned)
         raw_text = cleaned
 
+    # Always retain the real filenames used by this transaction, even when the
+    # model returns blank or altered filename fields.
+    result.setdefault("fileName", {})
+    result["fileName"]["sideViewImage"] = side_file_name
+    result["fileName"]["rearViewImage"] = rear_file_name
+    result["fileName"]["combinedImageName"] = combined_file_name
+
     df = normalize_result_rows(result, combined_file_name)
 
     return result, df, raw_text
 
 
-def save_reviewed_result(df, reviewer_note):
-    df = pd.DataFrame(df)
+def validate_result_df(df):
+    cleaned_df = pd.DataFrame(df).copy()
 
-    required_cols = ["imageFileName", "palletColor", "palletCount"]
-
-    for col in required_cols:
-        if col not in df.columns:
+    for col in CURRENT_COLUMNS:
+        if col not in cleaned_df.columns:
             raise ValueError(f"Missing required column: {col}")
 
-    df["palletCount"] = pd.to_numeric(
-        df["palletCount"],
-        errors="coerce"
+    cleaned_df["imageFileName"] = cleaned_df["imageFileName"].fillna("").astype(str)
+    cleaned_df["palletColor"] = cleaned_df["palletColor"].fillna("unknown").astype(str)
+    cleaned_df["palletCount"] = pd.to_numeric(
+        cleaned_df["palletCount"],
+        errors="coerce",
     ).fillna(0).astype(int)
 
-    final_total = int(df["palletCount"].sum())
+    return cleaned_df[CURRENT_COLUMNS]
 
-    final_result = {
-        "reviewedByUser": True,
-        "savedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "finalTotalPallets": final_total,
+
+def build_transaction(df, reviewer_note, ai_result, transaction_no):
+    cleaned_df = validate_result_df(df)
+    saved_at = now_bangkok()
+    result = ai_result or {}
+    summary = result.get("summary", {})
+    file_names = result.get("fileName", {})
+    final_total = int(cleaned_df["palletCount"].sum())
+
+    transaction = {
+        "transactionNo": int(transaction_no),
+        "savedAt": saved_at,
         "reviewerNote": reviewer_note or "",
-        "resultRows": df.to_dict(orient="records"),
-        "aiRawResult": st.session_state.ai_result,
+        "finalTotalPallets": final_total,
+        "confidence": result.get("confidence", "-"),
+        "riskOfError": summary.get("riskOfError", "-"),
+        "sideViewImage": file_names.get("sideViewImage", ""),
+        "rearViewImage": file_names.get("rearViewImage", ""),
+        "resultRows": cleaned_df.to_dict(orient="records"),
+        "aiRawResult": result,
     }
 
-    json_text = json.dumps(final_result, indent=2, ensure_ascii=False)
-    excel_bytes = create_excel_bytes(df)
+    flat_df = cleaned_df.copy()
+    flat_df.insert(0, "riskOfError", transaction["riskOfError"])
+    flat_df.insert(0, "confidence", transaction["confidence"])
+    flat_df.insert(0, "rearViewImage", transaction["rearViewImage"])
+    flat_df.insert(0, "sideViewImage", transaction["sideViewImage"])
+    flat_df.insert(0, "reviewerNote", transaction["reviewerNote"])
+    flat_df.insert(0, "savedAt", saved_at)
+    flat_df.insert(0, "transactionNo", int(transaction_no))
 
-    return json_text, excel_bytes, final_total
+    return transaction, flat_df[BATCH_COLUMNS], final_total
 
 
-def create_excel_bytes(df):
+def invalidate_download_files():
+    st.session_state.download_json = None
+    st.session_state.download_excel = None
+    st.session_state.download_total = 0
+    st.session_state.download_transaction_count = 0
+
+
+def append_current_transaction(reviewer_note):
+    if st.session_state.result_df.empty:
+        raise ValueError("ยังไม่มีผลวิเคราะห์สำหรับเพิ่มเป็น Transaction")
+
+    transaction, flat_df, final_total = build_transaction(
+        df=st.session_state.result_df,
+        reviewer_note=reviewer_note,
+        ai_result=st.session_state.ai_result,
+        transaction_no=st.session_state.transaction_no,
+    )
+
+    st.session_state.batch_transactions.append(transaction)
+    st.session_state.batch_df = pd.concat(
+        [st.session_state.batch_df, flat_df],
+        ignore_index=True,
+    )
+    invalidate_download_files()
+
+    return transaction["transactionNo"], final_total
+
+
+def clear_current_transaction(advance_transaction=False, clear_download=True):
+    st.session_state.ai_result = None
+    st.session_state.result_df = pd.DataFrame(columns=CURRENT_COLUMNS)
+    st.session_state.raw_json = ""
+    st.session_state.widget_version += 1
+
+    if advance_transaction:
+        st.session_state.transaction_no += 1
+
+    if clear_download:
+        invalidate_download_files()
+
+
+def reset_all_transactions():
+    st.session_state.batch_transactions = []
+    st.session_state.batch_df = pd.DataFrame(columns=BATCH_COLUMNS)
+    st.session_state.transaction_no = 1
+    st.session_state.flash_message = ""
+    clear_current_transaction(advance_transaction=False, clear_download=True)
+
+
+def create_excel_bytes(result_df, transaction_summary_df):
     from io import BytesIO
 
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Pallet Result")
+        result_df.to_excel(writer, index=False, sheet_name="Pallet Result")
+        transaction_summary_df.to_excel(
+            writer,
+            index=False,
+            sheet_name="Transaction Summary",
+        )
 
     output.seek(0)
     return output.getvalue()
+
+
+def create_batch_exports():
+    transactions = st.session_state.batch_transactions
+
+    if not transactions:
+        raise ValueError("ยังไม่มี Transaction สำหรับดาวน์โหลด")
+
+    result_df = st.session_state.batch_df.copy()
+    result_df["palletCount"] = pd.to_numeric(
+        result_df["palletCount"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+
+    transaction_summary_df = pd.DataFrame(
+        [
+            {
+                "transactionNo": tx["transactionNo"],
+                "savedAt": tx["savedAt"],
+                "reviewerNote": tx["reviewerNote"],
+                "finalTotalPallets": tx["finalTotalPallets"],
+                "confidence": tx["confidence"],
+                "riskOfError": tx["riskOfError"],
+                "sideViewImage": tx["sideViewImage"],
+                "rearViewImage": tx["rearViewImage"],
+            }
+            for tx in transactions
+        ]
+    )
+
+    grand_total = int(result_df["palletCount"].sum())
+    payload = {
+        "reviewedByUser": True,
+        "exportedAt": now_bangkok(),
+        "transactionCount": len(transactions),
+        "grandTotalPallets": grand_total,
+        "transactions": transactions,
+    }
+
+    json_text = json.dumps(payload, indent=2, ensure_ascii=False)
+    excel_bytes = create_excel_bytes(result_df, transaction_summary_df)
+
+    return json_text, excel_bytes, grand_total, len(transactions)
+
+
+def render_image_input(title_th, title_en, view_key, transaction_no, widget_version):
+    st.markdown(
+        f'<div class="upload-label-box">📷 {title_th}<br>{title_en}</div>',
+        unsafe_allow_html=True,
+    )
+
+    source = st.radio(
+        f"วิธีเลือกรูป {title_th}",
+        options=["📁 อัปโหลดรูป", "📷 ถ่ายรูป"],
+        horizontal=True,
+        key=f"{view_key}_source_{widget_version}",
+        label_visibility="collapsed",
+    )
+
+    if source == "📷 ถ่ายรูป":
+        image_file = st.camera_input(
+            f"ถ่ายรูป{title_th}",
+            key=f"{view_key}_camera_{widget_version}",
+            help="บนมือถือ ระบบจะขอสิทธิ์เปิดกล้องเพื่อถ่ายรูปโดยตรง",
+        )
+    else:
+        image_file = st.file_uploader(
+            f"อัปโหลดรูป{title_th}",
+            type=["jpg", "jpeg", "png"],
+            key=f"{view_key}_upload_{widget_version}",
+            label_visibility="collapsed",
+        )
+
+    if image_file:
+        st.image(
+            image_file,
+            caption=f"Transaction {transaction_no} — {title_en}",
+            use_container_width=True,
+        )
+
+    return image_file
 
 
 # =========================================================
@@ -611,56 +833,54 @@ st.markdown(
     """
 <div class="stepbar">
     <span class="step-done">1</span>
-    <span class="step-active">เลือกรูปภาพ</span>
+    <span class="step-active">เลือกรูป</span>
     <div class="step-sep"></div>
     <span class="step-circle-active">2</span>
     <span class="step-active">AI วิเคราะห์</span>
     <div class="step-sep"></div>
     <span class="step-circle">3</span>
-    <span>ยืนยันและบันทึก</span>
+    <span>เพิ่ม Transaction</span>
+    <div class="step-sep"></div>
+    <span class="step-circle">4</span>
+    <span>Download รวม</span>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
+if st.session_state.flash_message:
+    st.success(st.session_state.flash_message)
+    st.session_state.flash_message = ""
+
+st.markdown(f"### Transaction #{st.session_state.transaction_no}")
+st.caption("เลือกอัปโหลดรูปจากเครื่อง หรือถ่ายรูปใหม่จากกล้องมือถือได้ทั้ง 2 มุม")
+
 
 # =========================================================
-# UPLOAD SECTION
+# UPLOAD / CAMERA SECTION
 # =========================================================
+widget_version = st.session_state.widget_version
+current_transaction_no = st.session_state.transaction_no
+
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown(
-        '<div class="upload-label-box">📷 ด้านข้างรถบรรทุก<br>Side View</div>',
-        unsafe_allow_html=True,
+    side_upload = render_image_input(
+        title_th="ด้านข้างรถบรรทุก",
+        title_en="Side View",
+        view_key="side",
+        transaction_no=current_transaction_no,
+        widget_version=widget_version,
     )
-
-    side_upload = st.file_uploader(
-        "Upload side view",
-        type=["jpg", "jpeg", "png"],
-        key="side_upload",
-        label_visibility="collapsed",
-    )
-
-    if side_upload:
-        st.image(side_upload, use_container_width=True)
 
 with col2:
-    st.markdown(
-        '<div class="upload-label-box">📷 ด้านหลังรถบรรทุก<br>Rear View</div>',
-        unsafe_allow_html=True,
+    rear_upload = render_image_input(
+        title_th="ด้านหลังรถบรรทุก",
+        title_en="Rear View",
+        view_key="rear",
+        transaction_no=current_transaction_no,
+        widget_version=widget_version,
     )
-
-    rear_upload = st.file_uploader(
-        "Upload rear view",
-        type=["jpg", "jpeg", "png"],
-        key="rear_upload",
-        label_visibility="collapsed",
-    )
-
-    if rear_upload:
-        st.image(rear_upload, use_container_width=True)
-
 
 hint = st.text_area(
     "Optional Hint",
@@ -670,16 +890,21 @@ hint = st.text_area(
         "Both views confirm Height Layers."
     ),
     height=90,
+    key=f"hint_{widget_version}",
 )
 
 
 # =========================================================
 # ANALYZE BUTTON
 # =========================================================
-if st.button("✨ Analyze with AI", use_container_width=True):
+if st.button(
+    "✨ Analyze with AI",
+    use_container_width=True,
+    key=f"analyze_{widget_version}",
+):
     if not side_upload or not rear_upload:
         st.markdown(
-            '<div class="error-box">กรุณาอัปโหลดรูปภาพทั้ง 2 มุม: ด้านข้าง และ ด้านหลัง</div>',
+            '<div class="error-box">กรุณาเลือกรูปทั้ง 2 มุม: ด้านข้าง และด้านหลัง โดยอัปโหลดหรือถ่ายรูปจากกล้อง</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -689,13 +914,13 @@ if st.button("✨ Analyze with AI", use_container_width=True):
                     side_upload=side_upload,
                     rear_upload=rear_upload,
                     hint=hint,
+                    transaction_no=current_transaction_no,
                 )
 
                 st.session_state.ai_result = result
                 st.session_state.result_df = df
                 st.session_state.raw_json = raw_json
-                st.session_state.saved = False
-
+                invalidate_download_files()
                 st.success("AI วิเคราะห์เสร็จแล้ว")
 
             except Exception as e:
@@ -706,31 +931,32 @@ if st.button("✨ Analyze with AI", use_container_width=True):
 
 
 # =========================================================
-# RESULT SECTION
+# CURRENT RESULT SECTION
 # =========================================================
 df = st.session_state.result_df.copy()
-
-if "palletCount" in df.columns:
-    total = int(pd.to_numeric(df["palletCount"], errors="coerce").fillna(0).sum())
-else:
-    total = 0
-
 result = st.session_state.ai_result or {}
-explanation = result.get("countingExplanation", {})
-summary = result.get("summary", {})
 
-confidence = result.get("confidence", "-")
-risk = summary.get("riskOfError", "-")
+if not df.empty:
+    if "palletCount" in df.columns:
+        total = int(pd.to_numeric(df["palletCount"], errors="coerce").fillna(0).sum())
+    else:
+        total = 0
 
-height_layers = safe_int(explanation.get("heightLayers", 0))
-width_columns = safe_int(explanation.get("widthColumns", 0))
-depth_rows = safe_int(explanation.get("depthRows", 0))
+    explanation = result.get("countingExplanation", {})
+    summary = result.get("summary", {})
 
-st.markdown(
-    f"""
+    confidence = result.get("confidence", "-")
+    risk = summary.get("riskOfError", "-")
+
+    height_layers = safe_int(explanation.get("heightLayers", 0))
+    width_columns = safe_int(explanation.get("widthColumns", 0))
+    depth_rows = safe_int(explanation.get("depthRows", 0))
+
+    st.markdown(
+        f"""
 <div class="result-header">
     <div>
-        <div class="result-title">✨ ผล AI วิเคราะห์</div>
+        <div class="result-title">✨ ผล AI วิเคราะห์ — Transaction #{current_transaction_no}</div>
         <div class="result-sub">Confidence: {confidence} · Risk of Error: {risk}</div>
     </div>
     <div>
@@ -739,11 +965,11 @@ st.markdown(
     </div>
 </div>
 """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
-st.markdown(
-    f"""
+    st.markdown(
+        f"""
 <div class="info-card">
     <div style="font-size:13px;color:#888;margin-bottom:8px;">
         Counting Formula: Total Pallets = Height Layers × Width Columns × Depth Rows
@@ -764,171 +990,225 @@ st.markdown(
     </div>
 </div>
 """,
-    unsafe_allow_html=True,
-)
+        unsafe_allow_html=True,
+    )
 
-st.markdown(
-    f"""
+    st.markdown(
+        f"""
 <div class="total-bar">
-    <span class="total-label">รวมทั้งหมด หลัง AI วิเคราะห์ / หลังแก้ไข</span>
+    <span class="total-label">รวม Transaction ปัจจุบัน หลัง AI วิเคราะห์ / หลังแก้ไข</span>
     <span class="total-num">{total} พาเลท</span>
 </div>
 """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-<div class="note-box">
-    ℹ️ User สามารถแก้ไขจำนวนพาเลทหรือสีพาเลทได้ก่อนกดยืนยันและบันทึกข้อมูล
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# =========================================================
-# EDITABLE TABLE
-# =========================================================
-st.subheader("Result Table")
-
-edited_df = st.data_editor(
-    df,
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config={
-        "imageFileName": st.column_config.TextColumn(
-            "Image File Name",
-            disabled=False,
-        ),
-        "palletColor": st.column_config.SelectboxColumn(
-            "Pallet Color",
-            options=[
-                "red",
-                "blue",
-                "white",
-                "wood",
-                "black",
-                "green",
-                "other",
-                "unknown",
-            ],
-            required=True,
-        ),
-        "palletCount": st.column_config.NumberColumn(
-            "Pallet Count",
-            min_value=0,
-            max_value=999,
-            step=1,
-            required=True,
-        ),
-    },
-    key="editable_result_table",
-)
-
-st.session_state.result_df = edited_df
-
-
-# =========================================================
-# COUNTING EXPLANATION
-# =========================================================
-with st.expander("ดูรายละเอียดการคำนวณของ AI"):
-    st.write("Height Layers Explanation:")
-    st.write(explanation.get("heightLayersExplanation", "-"))
-
-    st.write("Width Columns Explanation:")
-    st.write(explanation.get("widthColumnsExplanation", "-"))
-
-    st.write("Depth Rows Explanation:")
-    st.write(explanation.get("depthRowsExplanation", "-"))
-
-    st.write("Formula:")
-    st.write(explanation.get("formula", "-"))
-
-    st.write("Calculation Method:")
-    st.write(explanation.get("calculationMethod", "-"))
-
-    st.write("Assumptions:")
-    st.write(summary.get("assumptions", "-"))
-
-
-with st.expander("Raw AI JSON"):
-    st.code(
-        json.dumps(result, indent=2, ensure_ascii=False) if result else "{}",
-        language="json",
+        unsafe_allow_html=True,
     )
 
+    st.markdown(
+        """
+<div class="note-box">
+    ℹ️ แก้ไขจำนวนหรือสีพาเลทได้ จากนั้นกด “เพิ่มข้อมูล” เพื่อเปิด Transaction ถัดไป
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("Current Transaction Result")
+
+    edited_df = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "imageFileName": st.column_config.TextColumn(
+                "Image File Name",
+                disabled=False,
+            ),
+            "palletColor": st.column_config.SelectboxColumn(
+                "Pallet Color",
+                options=[
+                    "red",
+                    "blue",
+                    "white",
+                    "wood",
+                    "black",
+                    "green",
+                    "other",
+                    "unknown",
+                ],
+                required=True,
+            ),
+            "palletCount": st.column_config.NumberColumn(
+                "Pallet Count",
+                min_value=0,
+                max_value=999,
+                step=1,
+                required=True,
+            ),
+        },
+        key=f"editable_result_table_{widget_version}",
+    )
+
+    st.session_state.result_df = edited_df
+
+    with st.expander("ดูรายละเอียดการคำนวณของ AI"):
+        st.write("Height Layers Explanation:")
+        st.write(explanation.get("heightLayersExplanation", "-"))
+
+        st.write("Width Columns Explanation:")
+        st.write(explanation.get("widthColumnsExplanation", "-"))
+
+        st.write("Depth Rows Explanation:")
+        st.write(explanation.get("depthRowsExplanation", "-"))
+
+        st.write("Formula:")
+        st.write(explanation.get("formula", "-"))
+
+        st.write("Calculation Method:")
+        st.write(explanation.get("calculationMethod", "-"))
+
+        st.write("Assumptions:")
+        st.write(summary.get("assumptions", "-"))
+
+    with st.expander("Raw AI JSON"):
+        st.code(
+            json.dumps(result, indent=2, ensure_ascii=False),
+            language="json",
+        )
+else:
+    st.info("ยังไม่มีผลวิเคราะห์สำหรับ Transaction ปัจจุบัน")
+
 
 # =========================================================
-# SAVE SECTION
+# REVIEWER NOTE
 # =========================================================
 reviewer_note = st.text_area(
-    "Reviewer Note",
-    placeholder="Add your note before saving...",
+    "Reviewer Note สำหรับ Transaction ปัจจุบัน",
+    placeholder="Add your note before adding this transaction...",
     height=90,
+    key=f"reviewer_note_{widget_version}",
 )
 
-b1, b2 = st.columns([1, 2])
 
-with b1:
-    if st.button("🔄 เริ่มใหม่", use_container_width=True):
-        st.session_state.ai_result = None
-        st.session_state.result_df = pd.DataFrame(
-            columns=["imageFileName", "palletColor", "palletCount"]
-        )
-        st.session_state.saved = False
-        st.session_state.raw_json = ""
+# =========================================================
+# ACCUMULATED TRANSACTIONS
+# =========================================================
+st.markdown("---")
+st.subheader("รายการ Transaction ที่เพิ่มแล้ว")
 
-        if "editable_result_table" in st.session_state:
-            del st.session_state["editable_result_table"]
+if st.session_state.batch_transactions:
+    batch_total = int(
+        pd.to_numeric(
+            st.session_state.batch_df["palletCount"],
+            errors="coerce",
+        ).fillna(0).sum()
+    )
 
+    m1, m2 = st.columns(2)
+    m1.metric("จำนวน Transaction", len(st.session_state.batch_transactions))
+    m2.metric("จำนวนพาเลทรวม", batch_total)
+
+    st.dataframe(
+        st.session_state.batch_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.caption("ยังไม่มี Transaction ที่เพิ่มไว้")
+
+
+# =========================================================
+# ACTION BUTTONS
+# =========================================================
+st.markdown("---")
+a1, a2, a3 = st.columns([1, 1.35, 1.65])
+
+with a1:
+    if st.button("🔄 ล้างรอบนี้", use_container_width=True):
+        clear_current_transaction(advance_transaction=False, clear_download=True)
+        st.session_state.flash_message = "ล้างข้อมูล Transaction ปัจจุบันแล้ว"
         st.rerun()
 
-with b2:
-    label = "✅ บันทึกแล้ว" if st.session_state.saved else "💾 ยืนยันและบันทึกข้อมูล"
-
-    if st.button(label, use_container_width=True):
-        if st.session_state.result_df.empty:
+with a2:
+    if st.button("➕ เพิ่มข้อมูล", use_container_width=True):
+        try:
+            transaction_no, transaction_total = append_current_transaction(reviewer_note)
+            clear_current_transaction(advance_transaction=True, clear_download=False)
+            st.session_state.flash_message = (
+                f"เพิ่ม Transaction #{transaction_no} สำเร็จ — {transaction_total} พาเลท "
+                "กรุณาเพิ่มรูปสำหรับ Transaction ถัดไป"
+            )
+            st.rerun()
+        except Exception as e:
             st.markdown(
-                '<div class="error-box">ยังไม่มีข้อมูลสำหรับบันทึก กรุณากด Analyze with AI ก่อน</div>',
+                f'<div class="error-box">Add transaction error: {type(e).__name__}: {e}</div>',
                 unsafe_allow_html=True,
             )
-        else:
-            try:
-                json_text, excel_bytes, final_total = save_reviewed_result(
-                    st.session_state.result_df,
-                    reviewer_note,
-                )
 
-                st.session_state.saved = True
+with a3:
+    if st.button("💾 ยืนยันและเตรียม Download", use_container_width=True):
+        try:
+            # Save the current analyzed transaction automatically if the user has
+            # not pressed “เพิ่มข้อมูล” yet.
+            if not st.session_state.result_df.empty:
+                append_current_transaction(reviewer_note)
+                clear_current_transaction(advance_transaction=True, clear_download=False)
 
-                st.markdown(
-                    f"""
-                <div class="toast-success">
-                    ✅ บันทึกข้อมูลสำเร็จ — รวม {final_total} พาเลท
-                </div>
-                """,
-                    unsafe_allow_html=True,
-                )
+            json_text, excel_bytes, grand_total, transaction_count = create_batch_exports()
 
-                st.download_button(
-                    label="Download JSON Result",
-                    data=json_text.encode("utf-8"),
-                    file_name="pallet_final_result.json",
-                    mime="application/json",
-                    use_container_width=True,
-                )
+            st.session_state.download_json = json_text.encode("utf-8")
+            st.session_state.download_excel = excel_bytes
+            st.session_state.download_total = grand_total
+            st.session_state.download_transaction_count = transaction_count
 
-                st.download_button(
-                    label="Download Excel Result",
-                    data=excel_bytes,
-                    file_name="pallet_final_result.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
+            st.success(
+                f"เตรียมไฟล์สำเร็จ — {transaction_count} Transactions, "
+                f"รวม {grand_total} พาเลท"
+            )
 
-            except Exception as e:
-                st.markdown(
-                    f'<div class="error-box">Save error: {type(e).__name__}: {e}</div>',
-                    unsafe_allow_html=True,
-                )
+        except Exception as e:
+            st.markdown(
+                f'<div class="error-box">Save error: {type(e).__name__}: {e}</div>',
+                unsafe_allow_html=True,
+            )
+
+
+# =========================================================
+# DOWNLOAD SECTION
+# =========================================================
+if st.session_state.download_json is not None:
+    st.markdown(
+        f"""
+<div class="toast-success">
+    ✅ พร้อมดาวน์โหลด {st.session_state.download_transaction_count} Transactions
+    — รวม {st.session_state.download_total} พาเลท
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    download_timestamp = datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y%m%d_%H%M%S")
+    d1, d2 = st.columns(2)
+
+    with d1:
+        st.download_button(
+            label="Download JSON Result",
+            data=st.session_state.download_json,
+            file_name=f"pallet_transactions_{download_timestamp}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    with d2:
+        st.download_button(
+            label="Download Excel Result",
+            data=st.session_state.download_excel,
+            file_name=f"pallet_transactions_{download_timestamp}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+if st.session_state.batch_transactions:
+    if st.button("🗑️ ล้าง Transaction ทั้งหมด", use_container_width=True):
+        reset_all_transactions()
+        st.session_state.flash_message = "ล้างรายการ Transaction ทั้งหมดแล้ว"
+        st.rerun()
