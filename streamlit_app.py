@@ -1029,7 +1029,16 @@ def natural_sort_key(value):
 
 
 def pair_folder_images(uploaded_files):
-    """Pair <base>.1.<ext> as side view with <base>.2.<ext> as rear view."""
+    """Pair filenames by their final digit before the extension.
+
+    Naming convention:
+    - <transaction>1.<ext> = Side View
+    - <transaction>2.<ext> = Rear View
+
+    Example:
+    - 690714-0613311.jpg -> transaction 690714-061331, Side View
+    - 690714-0613312.jpg -> transaction 690714-061331, Rear View
+    """
     grouped = {}
     ignored = []
     errors = []
@@ -1040,21 +1049,27 @@ def pair_folder_images(uploaded_files):
         file_name = path.name
         extension = path.suffix.lower()
         stem = file_name[:-len(extension)] if extension else file_name
-        match = re.match(r"^(?P<base>.+)\.(?P<view>[12])$", stem)
 
-        if not match:
+        # The final character of the filename stem identifies the image view.
+        # 1 = Side View, 2 = Rear View.
+        if len(stem) < 2 or stem[-1] not in {"1", "2"}:
             ignored.append(normalized_name)
             continue
 
-        base_name = match.group("base")
-        view_no = match.group("view")
+        base_name = stem[:-1].strip()
+        view_no = stem[-1]
+
+        if not base_name:
+            ignored.append(normalized_name)
+            continue
+
         parent = "" if str(path.parent) == "." else str(path.parent)
         transaction_key = f"{parent}/{base_name}" if parent else base_name
         transaction_group = grouped.setdefault(transaction_key, {})
 
         if view_no in transaction_group:
             errors.append(
-                f"พบไฟล์ซ้ำสำหรับ {transaction_key}.{view_no}: "
+                f"พบไฟล์ซ้ำสำหรับ {transaction_key} มุม {view_no}: "
                 f"{transaction_group[view_no].name} และ {normalized_name}"
             )
             continue
@@ -1067,8 +1082,11 @@ def pair_folder_images(uploaded_files):
         missing = [view_no for view_no in ("1", "2") if view_no not in views]
 
         if missing:
-            missing_label = ", ".join(f".{view_no}" for view_no in missing)
-            errors.append(f"{transaction_key} ขาดไฟล์มุม {missing_label}")
+            missing_label = ", ".join(
+                "Side View (ลงท้าย 1)" if view_no == "1" else "Rear View (ลงท้าย 2)"
+                for view_no in missing
+            )
+            errors.append(f"{transaction_key} ขาดไฟล์ {missing_label}")
             continue
 
         pairs.append(
@@ -1087,8 +1105,8 @@ def build_folder_pair_preview(pairs):
         [
             {
                 "Transaction": pair["folderTransaction"],
-                "Side View (.1)": pair["side"].name,
-                "Rear View (.2)": pair["rear"].name,
+                "Side View (ลงท้าย 1)": pair["side"].name,
+                "Rear View (ลงท้าย 2)": pair["rear"].name,
                 "Status": "พร้อมวิเคราะห์",
             }
             for pair in pairs
@@ -1438,8 +1456,8 @@ def render_folder_batch_tab():
     folder_version = st.session_state.folder_widget_version
     st.markdown("### อัปโหลดรูปทั้งโฟลเดอร์")
     st.caption(
-        "ตั้งชื่อไฟล์เป็นชื่อ Transaction เดียวกัน โดย .1 = Side View และ .2 = Rear View "
-        "เช่น TRX001.1.jpg และ TRX001.2.jpg"
+        "ตั้งชื่อไฟล์โดยใช้เลขตัวสุดท้ายก่อนนามสกุล: 1 = Side View และ 2 = Rear View "
+        "เช่น 690714-0613311.jpg และ 690714-0613312.jpg"
     )
 
     folder_files = st.file_uploader(
@@ -1467,7 +1485,7 @@ def render_folder_batch_tab():
                     st.write(f"- {message}")
 
         if ignored_files:
-            with st.expander(f"ไฟล์ที่ไม่ใช้ เพราะชื่อไม่ลงท้าย .1 หรือ .2 ({len(ignored_files)})"):
+            with st.expander(f"ไฟล์ที่ไม่ใช้ เพราะชื่อไม่ได้ลงท้ายด้วย 1 หรือ 2 ({len(ignored_files)})"):
                 for file_name in ignored_files:
                     st.write(f"- {file_name}")
 
@@ -1475,7 +1493,7 @@ def render_folder_batch_tab():
         "Optional Hint สำหรับรูปทั้งหมด",
         value=(
             "Use 3D pallet counting formula: Total Pallets = Height Layers × Width Columns × Depth Rows. "
-            "File ending .1 is the side view. File ending .2 is the rear view."
+            "The filename ending in 1 is the side view. The filename ending in 2 is the rear view."
         ),
         height=80,
         key=f"folder_hint_{folder_version}",
@@ -1489,7 +1507,7 @@ def render_folder_batch_tab():
         if not folder_files:
             st.error("กรุณาเลือกโฟลเดอร์รูปภาพก่อน")
         elif not pairs:
-            st.error("ไม่พบคู่ไฟล์ที่พร้อมวิเคราะห์ กรุณาตรวจชื่อไฟล์ .1 และ .2")
+            st.error("ไม่พบคู่ไฟล์ที่พร้อมวิเคราะห์ กรุณาตรวจว่าชื่อไฟล์ลงท้ายด้วย 1 และ 2")
         else:
             result_df, ai_results, analysis_errors = analyze_folder_pairs(pairs, folder_hint)
             st.session_state.folder_result_df = result_df
@@ -1539,8 +1557,8 @@ def render_folder_batch_tab():
         ],
         column_config={
             "folderTransaction": st.column_config.TextColumn("Transaction"),
-            "sideViewImage": st.column_config.TextColumn("Side View (.1)"),
-            "rearViewImage": st.column_config.TextColumn("Rear View (.2)"),
+            "sideViewImage": st.column_config.TextColumn("Side View (ลงท้าย 1)"),
+            "rearViewImage": st.column_config.TextColumn("Rear View (ลงท้าย 2)"),
             "confidence": st.column_config.TextColumn("Confidence"),
             "riskOfError": st.column_config.TextColumn("Risk"),
             "imageFileName": st.column_config.TextColumn("Image Pair"),
@@ -1698,7 +1716,7 @@ with st.sidebar:
     if selected_menu == "Upload by Transaction":
         st.info("อัปโหลดหรือถ่ายรูป Side View และ Rear View ทีละ Transaction")
     else:
-        st.info("อัปโหลดทั้ง Folder โดยใช้ .1 เป็น Side View และ .2 เป็น Rear View")
+        st.info("อัปโหลดทั้ง Folder โดยใช้เลขท้าย 1 เป็น Side View และเลขท้าย 2 เป็น Rear View")
 
 
 if selected_menu == "Upload by Transaction":
